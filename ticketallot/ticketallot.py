@@ -6,6 +6,8 @@
 #  ta status                                         — Plugin status
 #  ta toggle                                         — Enable / disable
 #  ta alertchannel #ch                               — Set escalation alert channel
+#  ta maxpending [n]                                 — View / set max pending per staff
+#  ta statschannel [#ch]                             — Set / clear auto-updating stats embed
 #  ta reset                                          — Wipe all assignment records
 #
 #  ta role add @R ratio [deadline] [escalation] [transfer]
@@ -136,6 +138,14 @@ class TicketAllot(commands.Cog):
 
         self.assignments: Dict[str, dict] = {}
 
+        # Max open (pending) tickets a staff member may hold before being
+        # skipped for new auto-assignments. 0 = unlimited.
+        self.max_pending: int = 0
+
+        # Channel + message id for the auto-updating stats embed.
+        self.stats_channel: Optional[int] = None
+        self.stats_message_id: Optional[int] = None
+
         self._reminder_msg_cache: Dict[str, discord.Message] = {}
 
     # ─── Reminder cache helper ────────────────────────────────────────────────
@@ -184,6 +194,9 @@ class TicketAllot(commands.Cog):
             "auto_reminder_enabled": True,
             "default_repeat":       120,
             "default_ping":         1,
+            "max_pending":          0,
+            "stats_channel":        None,
+            "stats_message_id":     None,
         }
         self.config = await self.db.find_one({"_id": "config"})
         if self.config is None:
@@ -205,9 +218,13 @@ class TicketAllot(commands.Cog):
         self.auto_reminder_enabled = self.config.get("auto_reminder_enabled", True)
         self.default_repeat        = self.config.get("default_repeat", 120)
         self.default_ping          = self.config.get("default_ping", 1)
+        self.max_pending           = self.config.get("max_pending", 0)
+        self.stats_channel         = self.config.get("stats_channel")
+        self.stats_message_id      = self.config.get("stats_message_id")
 
         self.deadline_check_loop.start()
         self.reminder_loop.start()
+        self.stats_update_loop.start()
 
         logger.info(
             "ticketallot: loaded — enabled=%s roles=%d assignments=%d "
@@ -219,6 +236,7 @@ class TicketAllot(commands.Cog):
     def cog_unload(self) -> None:
         self.deadline_check_loop.cancel()
         self.reminder_loop.cancel()
+        self.stats_update_loop.cancel()
         cached = len(self._reminder_msg_cache)
         self._reminder_msg_cache.clear()
         logger.info("ticketallot: unloaded — cleared %d cached reminder message(s)", cached)
@@ -237,6 +255,9 @@ class TicketAllot(commands.Cog):
                     "auto_reminder_enabled": self.auto_reminder_enabled,
                     "default_repeat":        self.default_repeat,
                     "default_ping":          self.default_ping,
+                    "max_pending":           self.max_pending,
+                    "stats_channel":         self.stats_channel,
+                    "stats_message_id":      self.stats_message_id,
                 }
             },
             upsert=True,
@@ -319,8 +340,11 @@ class TicketAllot(commands.Cog):
             member_share = role_ratio / len(members)
 
             for member in members:
-                total_count = self._member_total_count(member.id)
                 open_count = self._member_open_count(member.id)
+                if self.max_pending and open_count >= self.max_pending:
+                    continue  # at capacity — skip for new auto-assignment
+
+                total_count = self._member_total_count(member.id)
 
                 expected_total = (
                     total_after * (member_share / 100)
@@ -902,8 +926,88 @@ class TicketAllot(commands.Cog):
             logger.info("ticketallot: restarting deadline_check_loop after error")
             self.deadline_check_loop.start()
 
+    # ─── Background: Stats embed ──────────────────────────────────────────────
+
+    def _build_stats_embed(self) -> discord.Embed:
+        """Single-message embed: one line per staff member's open/total tickets."""
+        guild = self.bot.modmail_guild
+        embed = discord.Embed(
+            title="📊 Staff Ticket Stats",
+            color=self.bot.main_color,
+            timestamp=utcnow(),
+        )
+
+        staff: Dict[int, discord.Member] = {}
+        for rid in self.roles:
+            role = guild.get_role(int(rid))
+            if not role:
+                continue
+            staff.update({m.id: m for m in role.members if not m.bot})
+
+        if not staff:
+            embed.description = "No staff members found in configured roles."
+        else:
+            members = sorted(staff.values(), key=lambda m: -self._member_open_count(m.id))
+            lines = [
+                f"**{m.display_name}** — Open: `{self._member_open_count(m.id)}` "
+                f"| Total: `{self._member_total_count(m.id)}`"
+                for m in members
+            ]
+            # ponytail: one field per 15 lines to stay under Discord's 1024-char
+            # field limit; a team large enough to hit the 25-field embed cap
+            # should use `ta dashboard` instead of this at-a-glance view.
+            for i, chunk in enumerate(chunks(lines, 15)):
+                embed.add_field(name="Staff" if i == 0 else "\u200b", value="\n".join(chunk), inline=False)
+
+        embed.set_footer(text="Use `ta dashboard` for detailed breakdowns • Refreshes every 5m")
+        return embed
+
+    async def _update_stats_message(self) -> None:
+        """Edit the cached stats message in place, or post + cache a new one."""
+        if not self.stats_channel:
+            return
+        channel = self.bot.modmail_guild.get_channel(self.stats_channel)
+        if not channel:
+            logger.warning("ticketallot: configured stats channel %s not found", self.stats_channel)
+            return
+
+        embed = self._build_stats_embed()
+
+        msg: Optional[discord.Message] = None
+        if self.stats_message_id:
+            try:
+                msg = await channel.fetch_message(self.stats_message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                msg = None
+
+        if msg:
+            try:
+                await msg.edit(embed=embed)
+                return
+            except discord.HTTPException as e:
+                logger.warning("ticketallot: failed to edit stats message %s: %s", msg.id, e)
+
+        try:
+            sent = await channel.send(embed=embed)
+            self.stats_message_id = sent.id
+            await self._save()
+        except discord.HTTPException as e:
+            logger.warning("ticketallot: failed to post stats message: %s", e)
+
+    @tasks.loop(minutes=5)
+    async def stats_update_loop(self) -> None:
+        await self._update_stats_message()
+
+    @stats_update_loop.error
+    async def stats_update_loop_error(self, error: Exception) -> None:
+        logger.error("ticketallot: stats_update_loop crashed: %s", error, exc_info=error)
+        if not self.stats_update_loop.is_running():
+            logger.info("ticketallot: restarting stats_update_loop after error")
+            self.stats_update_loop.start()
+
     @reminder_loop.before_loop
     @deadline_check_loop.before_loop
+    @stats_update_loop.before_loop
     async def _before_loops(self) -> None:
         await self.bot.wait_until_ready()
         await asyncio.sleep(10)  # brief grace period after startup
@@ -1105,6 +1209,8 @@ class TicketAllot(commands.Cog):
         ─────────────────────────────────────────────────
         `{prefix}ta toggle`                   Enable / disable auto-assign
         `{prefix}ta alertchannel #channel`    Set escalation alert channel
+        `{prefix}ta maxpending [n]`           View / set max pending per staff (0=unlimited)
+        `{prefix}ta statschannel [#channel]`  Set / clear auto-updating stats embed channel
         `{prefix}ta status`                   Live status summary
         `{prefix}ta reset`                    ⚠️ Wipe all assignment records
 
@@ -1912,10 +2018,22 @@ class TicketAllot(commands.Cog):
             inline=True,
         )
         embed.add_field(
+            name="Max Pending / Staff",
+            value=f"**{self.max_pending}**" if self.max_pending else "Unlimited",
+            inline=True,
+        )
+        stats_ch = guild.get_channel(self.stats_channel) if self.stats_channel else None
+        embed.add_field(
+            name="Stats Embed",
+            value=stats_ch.mention if stats_ch else "⚠️ Not configured",
+            inline=True,
+        )
+        embed.add_field(
             name="Loops Running",
             value=(
                 f"Deadline: {'✅' if self.deadline_check_loop.is_running() else '❌'} | "
-                f"Reminder: {'✅' if self.reminder_loop.is_running() else '❌'}"
+                f"Reminder: {'✅' if self.reminder_loop.is_running() else '❌'} | "
+                f"Stats: {'✅' if self.stats_update_loop.is_running() else '❌'}"
             ),
             inline=True,
         )
@@ -1953,6 +2071,56 @@ class TicketAllot(commands.Cog):
         self.alert_channel = channel.id
         await self._save()
         await ctx.send(f"✅ Escalation alerts → {channel.mention}.")
+
+    @checks.has_permissions(PermissionLevel.ADMIN)
+    @ticketallot_.command(name="maxpending", aliases=["maxp"])
+    async def ta_maxpending(self, ctx, limit: int = None):
+        """
+        View or set the max open (pending) tickets a staff member may hold
+        before being skipped for new **automatic** assignments.
+
+        If every staff member across all roles is at the limit, a new ticket
+        is left unassigned rather than overloading someone.  Manual
+        `{prefix}ta assign` is unaffected. Set to `0` for unlimited (default).
+
+        **Example:** `{prefix}ta maxpending 5`
+        """
+        if limit is None:
+            value = f"**{self.max_pending}**" if self.max_pending else "Unlimited"
+            return await ctx.send(f"📋 Max pending per staff: {value}")
+        if limit < 0:
+            return await ctx.send("❌ Limit must be `0` (unlimited) or a positive number.")
+        self.max_pending = limit
+        await self._save()
+        value = f"**{limit}**" if limit else "Unlimited"
+        await ctx.send(f"✅ Max pending per staff set to {value}.")
+
+    @checks.has_permissions(PermissionLevel.ADMIN)
+    @ticketallot_.command(name="statschannel", aliases=["statsch"])
+    async def ta_statschannel(self, ctx, channel: discord.TextChannel = None):
+        """
+        Set or clear the channel for the auto-updating staff stats embed.
+
+        A single message listing every staff member's open/total ticket
+        count is posted there and refreshed in place every 5 minutes.
+        For deeper breakdowns use `{prefix}ta dashboard`.
+
+        Omit the channel to disable.
+
+        **Examples:**
+        `{prefix}ta statschannel #staff-stats`
+        `{prefix}ta statschannel`   — disable
+        """
+        self.stats_message_id = None  # old message (if any) is orphaned; a fresh one gets posted
+        if channel is None:
+            self.stats_channel = None
+            await self._save()
+            return await ctx.send("✅ Stats embed disabled.")
+
+        self.stats_channel = channel.id
+        await self._save()
+        await ctx.send(f"✅ Stats embed will be posted in {channel.mention} (refreshes every 5m).")
+        await self._update_stats_message()  # post immediately instead of waiting up to 5m
 
     @checks.has_permissions(PermissionLevel.ADMIN)
     @ticketallot_.command(name="reset")
